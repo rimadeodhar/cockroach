@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/externalconn/providers" // imported to register ExternalConnection providers
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -150,9 +151,9 @@ import (
 // A link to the issue will be printed out if the -print-blocklist-issues flag
 // is specified.
 //
-// There is a special directive '!metamorphic' that adjusts the server to force
-// the usage of production values for some constants that might change via the
-// metamorphic testing.
+// There is a special directive '!metamorphic-batch-sizes' that adjusts the
+// server to force the usage of production values related for some constants,
+// mostly related to batch sizes, that might change via metamorphic testing.
 //
 //
 // ###########################################################
@@ -381,6 +382,12 @@ import (
 //    Defines the start of a subtest. The subtest is any number of statements
 //    that occur after this command until the end of file or the next subtest
 //    command.
+//
+//  - retry
+//    Specifies that the next occurrence of a statement or query directive
+//    (including those which expect errors) will be retried for a fixed
+//    duration until the test passes, or the alloted time has elapsed.
+//    This is similar to the retry option of the query directive.
 //
 // The overall architecture of TestLogic is as follows:
 //
@@ -833,9 +840,6 @@ type logicQuery struct {
 	colTypes string
 	// colNames controls the inclusion of column names in the query result.
 	colNames bool
-	// retry indicates if the query should be retried in case of failure with
-	// exponential backoff up to some maximum duration.
-	retry bool
 	// some tests require the output to match modulo sorting.
 	sorter logicSorter
 	// expectedErr and expectedErrCode are as in logicStatement.
@@ -1015,6 +1019,12 @@ type logicTest struct {
 	// declarativeCorpusCollector used to save declarative schema changer state
 	// to disk.
 	declarativeCorpusCollector *corpus.Collector
+
+	// retry indicates if the statement or query should be retried in case of
+	// failure with exponential backoff up to some maximum duration. It is reset
+	// to false after every successful statement or query test point, including
+	// those which are supposed to error out.
+	retry bool
 }
 
 func (t *logicTest) t() *testing.T {
@@ -1188,6 +1198,35 @@ func (t *logicTest) newCluster(
 	knobOpts []knobOpt,
 	tenantClusterSettingOverrideOpts []tenantClusterSettingOverrideOpt,
 ) {
+	makeClusterSettings := func(forSystemTenant bool) *cluster.Settings {
+		var st *cluster.Settings
+		if forSystemTenant {
+			// System tenants use the constructor that doesn't initialize the
+			// cluster version (see makeTestConfigFromParams). This is needed
+			// for local-mixed-22.1-22.2 config.
+			st = cluster.MakeClusterSettings()
+		} else {
+			// Regular tenants use the constructor that initializes the cluster
+			// version (see TestServer.StartTenant).
+			st = cluster.MakeTestingClusterSettings()
+		}
+		// Disable stats collection on system tables before the cluster is
+		// started, otherwise there is a race condition where stats may be
+		// collected before we can disable them with `SET CLUSTER SETTING`. We
+		// disable stats collection on system tables in order to have
+		// deterministic tests.
+		stats.AutomaticStatisticsOnSystemTables.Override(context.Background(), &st.SV, false)
+		if t.cfg.UseFakeSpanResolver {
+			// We will need to update the DistSQL span resolver with the fake
+			// resolver, but this can only be done while DistSQL is disabled.
+			// Note that this is needed since the internal queries could use
+			// DistSQL if it's not disabled, and we have to disable it before
+			// the cluster started (so that we don't have any internal queries
+			// using DistSQL concurrently with updating the span resolver).
+			sql.DistSQLClusterExecMode.Override(context.Background(), &st.SV, int64(sessiondatapb.DistSQLOff))
+		}
+		return st
+	}
 	var corpusCollectionCallback func(p scplan.Plan, stageIdx int) error
 	if serverArgs.DeclarativeCorpusCollection && t.declarativeCorpusCollector != nil {
 		corpusCollectionCallback = t.declarativeCorpusCollector.GetBeforeStage(t.rootT.Name(), t.t())
@@ -1215,10 +1254,7 @@ func (t *logicTest) newCluster(
 
 	params := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			SQLMemoryPoolSize: serverArgs.MaxSQLMemoryLimit,
-			TempStorageConfig: base.DefaultTestTempStorageConfigWithSize(
-				cluster.MakeTestingClusterSettings(), tempStorageDiskLimit,
-			),
+			SQLMemoryPoolSize:        serverArgs.MaxSQLMemoryLimit,
 			DisableDefaultTestTenant: t.cfg.UseTenant || t.cfg.DisableDefaultTestTenant,
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
@@ -1337,6 +1373,10 @@ func (t *logicTest) newCluster(
 				}
 			}
 		}
+		nodeParams.Settings = makeClusterSettings(true /* forSystemTenant */)
+		nodeParams.TempStorageConfig = base.DefaultTestTempStorageConfigWithSize(
+			nodeParams.Settings, tempStorageDiskLimit,
+		)
 		paramsPerNode[i] = nodeParams
 	}
 	params.ServerArgsPerNode = paramsPerNode
@@ -1350,16 +1390,25 @@ func (t *logicTest) newCluster(
 
 	t.cluster = serverutils.StartNewTestCluster(t.rootT, cfg.NumNodes, params)
 	if cfg.UseFakeSpanResolver {
-		fakeResolver := physicalplanutils.FakeResolverForTestCluster(t.cluster)
-		t.cluster.Server(t.nodeIdx).SetDistSQLSpanResolver(fakeResolver)
+		// We need to update the DistSQL span resolver with the fake resolver.
+		// Note that DistSQL was disabled in makeClusterSetting above, so we
+		// will reset the setting after updating the span resolver.
+		for nodeIdx := 0; nodeIdx < cfg.NumNodes; nodeIdx++ {
+			fakeResolver := physicalplanutils.FakeResolverForTestCluster(t.cluster)
+			t.cluster.Server(nodeIdx).SetDistSQLSpanResolver(fakeResolver)
+		}
+		serverutils.SetClusterSetting(t.rootT, t.cluster, "sql.defaults.distsql", "auto")
 	}
 
 	connsForClusterSettingChanges := []*gosql.DB{t.cluster.ServerConn(0)}
 	if cfg.UseTenant {
 		t.tenantAddrs = make([]string, cfg.NumNodes)
 		for i := 0; i < cfg.NumNodes; i++ {
+			settings := makeClusterSettings(false /* forSystemTenant */)
+			tempStorageConfig := base.DefaultTestTempStorageConfigWithSize(settings, tempStorageDiskLimit)
 			tenantArgs := base.TestTenantArgs{
 				TenantID:                    serverutils.TestTenantID(),
+				Settings:                    settings,
 				AllowSettingClusterSettings: true,
 				TestingKnobs: base.TestingKnobs{
 					SQLExecutor: &sql.ExecutorTestingKnobs{
@@ -1375,7 +1424,7 @@ func (t *logicTest) newCluster(
 					RangeFeed: paramsPerNode[i].Knobs.RangeFeed,
 				},
 				MemoryPoolSize:    params.ServerArgs.SQLMemoryPoolSize,
-				TempStorageConfig: &params.ServerArgs.TempStorageConfig,
+				TempStorageConfig: &tempStorageConfig,
 				Locality:          paramsPerNode[i].Locality,
 				TracingDefault:    params.ServerArgs.TracingDefault,
 				// Give every tenant its own ExternalIO directory.
@@ -2260,6 +2309,20 @@ func fetchSubtests(path string) ([]subtestDetails, error) {
 	return subtests, nil
 }
 
+func (t *logicTest) purgeZoneConfig() {
+	if t.cluster == nil {
+		// We can only purge zone configs for in-memory test clusters.
+		return
+	}
+	for i := 0; i < t.cluster.NumServers(); i++ {
+		sysconfigProvider := t.cluster.Server(i).SystemConfigProvider()
+		sysconfig := sysconfigProvider.GetSystemConfig()
+		if sysconfig != nil {
+			sysconfig.PurgeZoneConfigCache()
+		}
+	}
+}
+
 func (t *logicTest) processSubtest(
 	subtest subtestDetails, path string, config logictestbase.TestClusterConfig, rng *rand.Rand,
 ) error {
@@ -2269,6 +2332,8 @@ func (t *logicTest) processSubtest(
 	t.lastProgress = timeutil.Now()
 
 	repeat := 1
+	t.retry = false
+
 	for s.Scan() {
 		t.curPath, t.curLineNo = path, s.Line+subtest.lineLineIndexIntoFile
 		if *maxErrs > 0 && t.failures >= *maxErrs {
@@ -2357,6 +2422,11 @@ func (t *logicTest) processSubtest(
 
 			t.success(path)
 
+		case "retry":
+			// retry is a standalone command that may precede a "statement" or "query"
+			// command. It has the same retry effect as the retry option of the query
+			// command.
+			t.retry = true
 		case "statement":
 			stmt := logicStatement{
 				pos:         fmt.Sprintf("\n%s:%d", path, s.Line+subtest.lineLineIndexIntoFile),
@@ -2387,7 +2457,19 @@ func (t *logicTest) processSubtest(
 			}
 			if !s.Skip {
 				for i := 0; i < repeat; i++ {
-					if cont, err := t.execStatement(stmt); err != nil {
+					var cont bool
+					var err error
+					if t.retry {
+						err = testutils.SucceedsSoonError(func() error {
+							t.purgeZoneConfig()
+							var tempErr error
+							cont, tempErr = t.execStatement(stmt)
+							return tempErr
+						})
+					} else {
+						cont, err = t.execStatement(stmt)
+					}
+					if err != nil {
 						if !cont {
 							return err
 						}
@@ -2528,7 +2610,7 @@ func (t *logicTest) processSubtest(
 							query.colNames = true
 
 						case "retry":
-							query.retry = true
+							t.retry = true
 
 						case "kvtrace":
 							// kvtrace without any arguments doesn't perform any additional
@@ -2711,14 +2793,16 @@ func (t *logicTest) processSubtest(
 				}
 
 				for i := 0; i < repeat; i++ {
-					if query.retry && !*rewriteResultsInTestfiles {
+					if t.retry && !*rewriteResultsInTestfiles {
 						if err := testutils.SucceedsSoonError(func() error {
+							t.purgeZoneConfig()
 							return t.execQuery(query)
 						}); err != nil {
 							t.Error(err)
 						}
 					} else {
-						if query.retry && *rewriteResultsInTestfiles {
+						if t.retry && *rewriteResultsInTestfiles {
+							t.purgeZoneConfig()
 							// The presence of the retry flag indicates that we expect this
 							// query may need some time to succeed. If we are rewriting, wait
 							// 500ms before executing the query.
@@ -3623,6 +3707,7 @@ func (t *logicTest) formatValues(vals []string, valsPerLine int) []string {
 }
 
 func (t *logicTest) success(file string) {
+	t.retry = false
 	t.progress++
 	now := timeutil.Now()
 	if now.Sub(t.lastProgress) >= 2*time.Second {
@@ -3860,7 +3945,8 @@ func RunLogicTest(
 	}
 
 	// Check whether the test can only be run in non-metamorphic mode.
-	_, onlyNonMetamorphic := logictestbase.ReadTestFileConfigs(t, path, logictestbase.ConfigSet{configIdx})
+	_, nonMetamorphicBatchSizes :=
+		logictestbase.ReadTestFileConfigs(t, path, logictestbase.ConfigSet{configIdx})
 	config := logictestbase.LogicTestConfigs[configIdx]
 
 	// The tests below are likely to run concurrently; `log` is shared
@@ -3912,7 +3998,12 @@ func RunLogicTest(
 	}
 	// Each test needs a copy because of Parallel
 	serverArgsCopy := serverArgs
-	serverArgsCopy.ForceProductionValues = serverArgs.ForceProductionValues || onlyNonMetamorphic
+	serverArgsCopy.ForceProductionValues = serverArgs.ForceProductionValues || nonMetamorphicBatchSizes
+	if serverArgsCopy.ForceProductionValues {
+		if err := coldata.SetBatchSizeForTests(coldata.DefaultColdataBatchSize); err != nil {
+			panic(errors.Wrapf(err, "could not set batch size for test"))
+		}
+	}
 	lt.setup(
 		config, serverArgsCopy, readClusterOptions(t, path), readKnobOptions(t, path), readTenantClusterSettingOverrideArgs(t, path),
 	)
